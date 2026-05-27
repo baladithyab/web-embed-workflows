@@ -1,0 +1,14 @@
+{
+  "name": "web-embed-workflows",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate": "bunx tsx scripts/validate-manifest.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "zod": "^4.0.0"
+  }
+}

@@ -1,0 +1,134 @@
+name: static-passthrough
+
+# Reusable workflow: takes a directory tree of static-html (HTML/JS/CSS/assets/etc.),
+# uploads it to R2 under <slug>/<git-sha>/, and bumps the manifest in the
+# calling repo to pin to the new version.
+
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: 'Path to web.codeseys.json (relative to repo root)'
+        required: false
+        default: 'web.codeseys.json'
+        type: string
+      source-dir:
+        description: 'Directory to upload (relative to repo root)'
+        required: false
+        default: '.'
+        type: string
+      bucket:
+        description: 'R2 bucket name'
+        required: false
+        default: 'assets-r2'
+        type: string
+      bucket-public-host:
+        description: 'Public hostname serving the bucket (no trailing slash)'
+        required: false
+        default: 'https://assets-r2.codeseys.io'
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          MANIFEST_PATH="${{ inputs.manifest }}"
+          if [ ! -f "$MANIFEST_PATH" ]; then
+            echo "::error::manifest not found at $MANIFEST_PATH"
+            exit 1
+          fi
+          SLUG=$(jq -r '.slug' "$MANIFEST_PATH")
+          KIND=$(jq -r '.embed.kind' "$MANIFEST_PATH")
+          if [ "$KIND" != "static-html" ]; then
+            echo "::error::static-passthrough.yml expects embed.kind = static-html, got '$KIND'"
+            exit 1
+          fi
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "slug=$SLUG" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Stage source directory
+        id: stage
+        run: |
+          set -euo pipefail
+          STAGE_DIR="${RUNNER_TEMP}/stage"
+          mkdir -p "$STAGE_DIR"
+          # Use rsync with explicit excludes — never upload .git, .github, node_modules, etc.
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='node_modules/' \
+            --exclude='.DS_Store' \
+            --exclude='Thumbs.db' \
+            --exclude='*.rar' \
+            --exclude='*.zip' \
+            --exclude='*.synctex.gz' \
+            "${{ inputs.source-dir }}/" "$STAGE_DIR/"
+          BYTES=$(du -sb "$STAGE_DIR" | awk '{print $1}')
+          echo "stage_dir=$STAGE_DIR" >> $GITHUB_OUTPUT
+          echo "bytes=$BYTES" >> $GITHUB_OUTPUT
+          echo "Staged $BYTES bytes from ${{ inputs.source-dir }}"
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          BUCKET: ${{ inputs.bucket }}
+          SLUG: ${{ steps.manifest.outputs.slug }}
+          SHA: ${{ steps.manifest.outputs.short_sha }}
+          STAGE: ${{ steps.stage.outputs.stage_dir }}
+        run: |
+          set -euo pipefail
+          aws s3 sync "$STAGE/" "s3://$BUCKET/$SLUG/$SHA/" \
+            --endpoint-url "$R2_ENDPOINT_URL" \
+            --no-progress
+
+      - name: Update manifest in repo
+        env:
+          BUCKET_HOST: ${{ inputs.bucket-public-host }}
+          SLUG: ${{ steps.manifest.outputs.slug }}
+          SHA: ${{ steps.manifest.outputs.short_sha }}
+          BYTES: ${{ steps.stage.outputs.bytes }}
+          MANIFEST_PATH: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          NEW_URL="${BUCKET_HOST}/${SLUG}/${SHA}/"
+          jq \
+            --arg url "$NEW_URL" \
+            --arg version "$SHA" \
+            --argjson bytes "$BYTES" \
+            '.delivery.url = $url | .delivery.version = $version | .delivery.sizeBytes = $bytes' \
+            "$MANIFEST_PATH" > "${MANIFEST_PATH}.new"
+          mv "${MANIFEST_PATH}.new" "$MANIFEST_PATH"
+
+      - name: Commit manifest bump back to repo
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          SHA: ${{ steps.manifest.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$MANIFEST_PATH"; then
+            echo "manifest unchanged; nothing to commit"
+            exit 0
+          fi
+          git config user.name 'web-embed-bot'
+          git config user.email 'web-embed-bot@users.noreply.github.com'
+          git add "$MANIFEST_PATH"
+          git commit -m "chore(embed): bump delivery to ${SHA} [skip ci]"
+          # push directly to the same branch since this is a trivial bump
+          git push origin HEAD
