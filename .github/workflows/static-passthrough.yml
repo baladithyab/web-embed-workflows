@@ -1,8 +1,17 @@
 name: static-passthrough
 
-# Reusable workflow: takes a directory tree of static-html (HTML/JS/CSS/assets/etc.),
-# uploads it to R2 under <slug>/<git-sha>/, and bumps the manifest in the
-# calling repo to pin to the new version.
+# Reusable workflow for embed.kind = "static-html".
+#
+# Uploads a directory tree of static files (HTML/JS/CSS/assets/...) into the
+# project-embed assets bucket via the personal-site Worker's binding-proxy
+# upload endpoint. Auth is a single shared bearer token; no R2 S3 keys
+# anywhere.
+#
+# Stored at:    r2://assets-r2/<slug>/<git-sha>/<path>
+# Served from:  https://assets-r2.codeseys.io/<slug>/<git-sha>/<path>
+#
+# Calling repos invoke this with `secrets: inherit` so the workflow can
+# read the user-level secret PROJECT_EMBED_UPLOAD_TOKEN.
 
 on:
   workflow_call:
@@ -17,10 +26,10 @@ on:
         required: false
         default: '.'
         type: string
-      bucket:
-        description: 'R2 bucket name'
+      upload-endpoint:
+        description: 'Personal-site upload endpoint'
         required: false
-        default: 'assets-r2'
+        default: 'https://codeseys.io/api/embed-upload'
         type: string
       bucket-public-host:
         description: 'Public hostname serving the bucket (no trailing slash)'
@@ -66,7 +75,6 @@ jobs:
           set -euo pipefail
           STAGE_DIR="${RUNNER_TEMP}/stage"
           mkdir -p "$STAGE_DIR"
-          # Use rsync with explicit excludes — never upload .git, .github, node_modules, etc.
           rsync -a \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -78,25 +86,56 @@ jobs:
             --exclude='*.synctex.gz' \
             "${{ inputs.source-dir }}/" "$STAGE_DIR/"
           BYTES=$(du -sb "$STAGE_DIR" | awk '{print $1}')
+          FILES=$(find "$STAGE_DIR" -type f | wc -l)
           echo "stage_dir=$STAGE_DIR" >> $GITHUB_OUTPUT
           echo "bytes=$BYTES" >> $GITHUB_OUTPUT
-          echo "Staged $BYTES bytes from ${{ inputs.source-dir }}"
+          echo "Staged $BYTES bytes ($FILES files) from ${{ inputs.source-dir }}"
 
-      - name: Upload to R2
+      - name: Upload via Worker binding-proxy
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          BUCKET: ${{ inputs.bucket }}
+          UPLOAD_ENDPOINT: ${{ inputs.upload-endpoint }}
+          UPLOAD_TOKEN: ${{ secrets.PROJECT_EMBED_UPLOAD_TOKEN }}
           SLUG: ${{ steps.manifest.outputs.slug }}
-          SHA: ${{ steps.manifest.outputs.short_sha }}
+          VERSION: ${{ steps.manifest.outputs.short_sha }}
           STAGE: ${{ steps.stage.outputs.stage_dir }}
         run: |
           set -euo pipefail
-          aws s3 sync "$STAGE/" "s3://$BUCKET/$SLUG/$SHA/" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --no-progress
+          if [ -z "$UPLOAD_TOKEN" ]; then
+            echo "::error::PROJECT_EMBED_UPLOAD_TOKEN is not set; configure it as a user/org/repo secret"
+            exit 1
+          fi
+          # Pre-flight health check
+          health=$(curl -s -o /dev/null -w '%{http_code}' "$UPLOAD_ENDPOINT")
+          if [ "$health" != "200" ]; then
+            echo "::error::Upload endpoint health check failed: HTTP $health"
+            exit 1
+          fi
+          echo "Uploading to ${UPLOAD_ENDPOINT}?slug=${SLUG}&version=${VERSION}&path=<path>"
+          # Upload each file individually. Cap per-file at 90 MiB on the server
+          # side; this loop just streams them in sequence.
+          FAIL=0
+          while IFS= read -r -d '' f; do
+            rel="${f#${STAGE}/}"
+            # URL-encode the path: convert spaces to %20 (most other chars in our
+            # file set are already URL-safe).
+            enc_rel=$(jq -nr --arg p "$rel" '$p|@uri')
+            url="${UPLOAD_ENDPOINT}?slug=${SLUG}&version=${VERSION}&path=${enc_rel}"
+            code=$(curl -sS -X PUT "$url" \
+              -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+              --data-binary "@${f}" \
+              -o /tmp/upload-resp.json \
+              -w '%{http_code}')
+            if [ "$code" != "200" ]; then
+              echo "::warning::Upload failed for $rel (HTTP $code): $(cat /tmp/upload-resp.json 2>/dev/null || true)"
+              FAIL=1
+            else
+              echo "  ✓ $rel"
+            fi
+          done < <(find "${STAGE}" -type f -print0)
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::One or more uploads failed"
+            exit 1
+          fi
 
       - name: Update manifest in repo
         env:
@@ -130,5 +169,4 @@ jobs:
           git config user.email 'web-embed-bot@users.noreply.github.com'
           git add "$MANIFEST_PATH"
           git commit -m "chore(embed): bump delivery to ${SHA} [skip ci]"
-          # push directly to the same branch since this is a trivial bump
           git push origin HEAD

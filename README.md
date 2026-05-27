@@ -23,15 +23,16 @@ or the canonical reference in
 All workflows expect:
 
 - A `web.codeseys.json` at the calling repo's root.
-- Caller passes `secrets: inherit` so the workflow picks up the four R2 credentials from organization or user-level secrets:
-  - `R2_ACCESS_KEY_ID`
-  - `R2_SECRET_ACCESS_KEY`
-  - `R2_ENDPOINT_URL` (e.g. `https://<account_id>.r2.cloudflarestorage.com`)
-  - `R2_BUCKET` (default: `assets-r2`)
+- Caller passes `secrets: inherit` so the workflow picks up the upload bearer token from organization, user-level, or repo secrets:
+  - `PROJECT_EMBED_UPLOAD_TOKEN` — shared bearer that authenticates against `https://codeseys.io/api/embed-upload`.
+
+The personal-site Worker holds the only R2 binding; CI never sees S3
+credentials. The Worker validates the bearer token, validates slug/path,
+and writes via `env.PROJECT_ASSETS.put()`.
 
 All workflows publish to:
 ```
-s3://${R2_BUCKET}/<slug>/<git-sha>/...
+r2://assets-r2/<slug>/<git-sha>/...
 ```
 and serve from:
 ```
