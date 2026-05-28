@@ -312,4 +312,18 @@ jobs:
           git config user.email 'web-embed-bot@users.noreply.github.com'
           git add "$MANIFEST_PATH"
           git commit -m "chore(embed): bump delivery to ${SHA} [skip ci]"
-          git push origin HEAD
+          # Race-resilient push: if remote moved (e.g. another commit
+          # landed during this run), rebase + retry up to 3 times.
+          for attempt in 1 2 3; do
+            if git push origin HEAD; then
+              echo "Pushed manifest bump on attempt $attempt"
+              exit 0
+            fi
+            echo "Push failed; pulling --rebase + retrying (attempt $attempt/3)"
+            git pull --rebase --autostash origin "$(git rev-parse --abbrev-ref HEAD)" || {
+              echo "::error::rebase failed; manifest bump abandoned"
+              exit 1
+            }
+          done
+          echo "::error::Push failed after 3 attempts; manifest bump not committed"
+          exit 1
