@@ -112,6 +112,53 @@ jobs:
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "schema_version=$SCHEMA_VERSION" >> $GITHUB_OUTPUT
 
+      - name: Install apt packages declared in manifest
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          # Pull `build.aptPackages` from the manifest if present.
+          PKGS=$(jq -r '(.build.aptPackages // []) | join(" ")' "$MANIFEST_PATH")
+          if [ -z "$PKGS" ]; then
+            echo "No build.aptPackages in manifest; skipping apt install"
+            exit 0
+          fi
+          echo "Installing: $PKGS"
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $PKGS
+
+      - name: Run build.script (if declared)
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          SHORT_SHA: ${{ steps.manifest.outputs.short_sha }}
+          SLUG: ${{ steps.manifest.outputs.slug }}
+        run: |
+          set -euo pipefail
+          # `build.script` is an optional path to an executable that
+          # transforms source → upload-ready artifacts in-place under
+          # ${{ inputs.source-dir }}.
+          BUILD_SCRIPT=$(jq -r '.build.script // empty' "$MANIFEST_PATH")
+          if [ -z "$BUILD_SCRIPT" ]; then
+            echo "No build.script in manifest; skipping pre-upload transform"
+            exit 0
+          fi
+          if [ ! -f "$BUILD_SCRIPT" ]; then
+            echo "::error::build.script declared as '$BUILD_SCRIPT' but file not found"
+            exit 1
+          fi
+          if [ ! -x "$BUILD_SCRIPT" ]; then
+            echo "Marking $BUILD_SCRIPT as executable"
+            chmod +x "$BUILD_SCRIPT"
+          fi
+          echo "Running $BUILD_SCRIPT (source-dir=${{ inputs.source-dir }})"
+          # The script gets the manifest values as env vars in case it needs them.
+          export EMBED_SLUG="$SLUG"
+          export EMBED_VERSION="$SHORT_SHA"
+          export EMBED_SOURCE_DIR="${{ inputs.source-dir }}"
+          time "./$BUILD_SCRIPT"
+          echo "Build script complete; staged outputs ready for upload"
+
       - name: Stage source directory
         id: stage
         run: |
