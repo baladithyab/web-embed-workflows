@@ -60,14 +60,44 @@ jobs:
             exit 1
           fi
           SLUG=$(jq -r '.slug' "$MANIFEST_PATH")
-          KIND=$(jq -r '.embed.kind' "$MANIFEST_PATH")
-          if [ "$KIND" != "static-html" ]; then
-            echo "::error::static-passthrough.yml expects embed.kind = static-html, got '$KIND'"
+          SCHEMA_VERSION=$(jq -r '.schemaVersion' "$MANIFEST_PATH")
+          # static-passthrough handles three shapes:
+          #  v1: { embed: { kind: ... } }
+          #  v2 single-asset: { assets: [{ embed: {...} }] } (length == 1)
+          #  v2 multi-asset:  { assets: [...] } (length > 1)
+          # The actual embed kinds *inside* a v2 manifest can be anything that
+          # this workflow can handle (essentially anything that compiles down
+          # to "files served from R2"). The check below is permissive and lets
+          # authors mix static-html / wasm / tex-pdf in one manifest.
+          if [ "$SCHEMA_VERSION" = "1" ]; then
+            KIND=$(jq -r '.embed.kind' "$MANIFEST_PATH")
+            case "$KIND" in
+              static-html|wasm-emscripten|wasm-rust|notebook-html|tex-pdf)
+                echo "manifest schemaVersion=1, embed.kind=$KIND"
+                ;;
+              *)
+                echo "::error::static-passthrough.yml does not handle embed.kind '$KIND'"
+                exit 1
+                ;;
+            esac
+          elif [ "$SCHEMA_VERSION" = "2" ]; then
+            ASSET_COUNT=$(jq -r '.assets | length' "$MANIFEST_PATH")
+            echo "manifest schemaVersion=2, assets=$ASSET_COUNT"
+            # Reject any asset kind we can't upload via static passthrough.
+            BAD_KIND=$(jq -r '.assets[].embed.kind' "$MANIFEST_PATH" | \
+              grep -vE '^(static-html|wasm-emscripten|wasm-rust|notebook-html|tex-pdf|pglite-db)$' || true)
+            if [ -n "$BAD_KIND" ]; then
+              echo "::error::static-passthrough.yml does not handle asset embed.kind: $BAD_KIND"
+              exit 1
+            fi
+          else
+            echo "::error::unknown manifest schemaVersion: $SCHEMA_VERSION"
             exit 1
           fi
           SHORT_SHA=$(git rev-parse --short HEAD)
           echo "slug=$SLUG" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "schema_version=$SCHEMA_VERSION" >> $GITHUB_OUTPUT
 
       - name: Stage source directory
         id: stage

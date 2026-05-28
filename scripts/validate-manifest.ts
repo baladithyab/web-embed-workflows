@@ -1,6 +1,9 @@
 #!/usr/bin/env bun
 // Validates a web.codeseys.json against the project-embed schema.
 // Usage: bunx tsx scripts/validate-manifest.ts path/to/web.codeseys.json
+//
+// Mirrors src/lib/types/project-manifest.ts in baladithyab/baladithyab.github.io
+// — keep these two files in lockstep when the schema evolves.
 
 import { readFile } from 'node:fs/promises'
 import { z } from 'zod'
@@ -30,9 +33,36 @@ const Category = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('research'), venue: z.string().optional(), year: z.number().int() }),
 ])
 
-const ProjectManifest = z.object({
+const Asset = z.object({
+  id: z
+    .string()
+    .regex(/^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/, 'asset id must be lowercase alphanumeric with hyphens, ≤40 chars'),
+  title: z.string().min(1),
+  description: z.string().optional(),
+  group: z.string().optional(),
+  embed: EmbedSpec,
+  sizeBytes: z.number().int().min(0).optional(),
+})
+
+const Delivery = z.object({
+  mode: z.enum(['bundle', 'runtime-r2', 'runtime-foreign']),
+  url: z.string().url(),
+  version: z.string().min(1),
+  sizeBytes: z.number().int().min(0),
+})
+
+const Build = z.object({
+  ci: z.boolean(),
+  workflow: z.string().optional(),
+})
+
+const Slug = z
+  .string()
+  .regex(/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/, 'slug must be lowercase, hyphen-separated, ≤64 chars')
+
+const ProjectManifestV1 = z.object({
   schemaVersion: z.literal(1),
-  slug: z.string().regex(/^[a-z0-9-]+$/, 'slug must be lowercase alphanumeric with hyphens'),
+  slug: Slug,
   category: Category,
   title: z.string().min(1),
   description: z.string().min(1),
@@ -40,17 +70,29 @@ const ProjectManifest = z.object({
   thumbnail: z.string().optional(),
   completionLevel: z.enum(['wip', 'works', 'ships']),
   embed: EmbedSpec,
-  delivery: z.object({
-    mode: z.enum(['bundle', 'runtime-r2', 'runtime-foreign']),
-    url: z.string().url(),
-    version: z.string().min(1),
-    sizeBytes: z.number().int().min(0),
-  }),
-  build: z.object({
-    ci: z.boolean(),
-    workflow: z.string().optional(),
-  }),
+  delivery: Delivery,
+  build: Build,
 })
+
+const ProjectManifestV2 = z.object({
+  schemaVersion: z.literal(2),
+  slug: Slug,
+  category: Category,
+  title: z.string().min(1),
+  description: z.string().min(1),
+  tags: z.array(z.string()).default([]),
+  thumbnail: z.string().optional(),
+  completionLevel: z.enum(['wip', 'works', 'ships']),
+  assets: z.array(Asset).min(1, 'v2 manifest must declare at least one asset'),
+  defaultAssetId: z.string().optional(),
+  delivery: Delivery,
+  build: Build,
+})
+
+const ProjectManifest = z.discriminatedUnion('schemaVersion', [
+  ProjectManifestV1,
+  ProjectManifestV2,
+])
 
 const path = process.argv[2]
 if (!path) {
@@ -77,7 +119,15 @@ if (!result.success) {
 }
 
 console.log(`✓ ${path} valid`)
-console.log(`  slug:           ${result.data.slug}`)
-console.log(`  embed.kind:     ${result.data.embed.kind}`)
-console.log(`  delivery.mode:  ${result.data.delivery.mode}`)
-console.log(`  completion:     ${result.data.completionLevel}`)
+console.log(`  schemaVersion: ${result.data.schemaVersion}`)
+console.log(`  slug:          ${result.data.slug}`)
+console.log(`  delivery.mode: ${result.data.delivery.mode}`)
+console.log(`  completion:    ${result.data.completionLevel}`)
+if (result.data.schemaVersion === 1) {
+  console.log(`  embed.kind:    ${result.data.embed.kind}`)
+} else {
+  console.log(`  assets:        ${result.data.assets.length}`)
+  for (const a of result.data.assets) {
+    console.log(`    · ${a.id} (${a.embed.kind}) — ${a.title}`)
+  }
+}
