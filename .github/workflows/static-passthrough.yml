@@ -132,6 +132,32 @@ jobs:
           # shellcheck disable=SC2086
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $PKGS
 
+      - name: Detect build.tools requested in manifest
+        id: tools
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          # Returns 'true'/'false' for each known tool, used to gate the
+          # tool-specific setup steps below. Avoids needing `if:` boolean
+          # parsing of jq output, which is a footgun in Actions.
+          TOOLS=$(jq -r '(.build.tools // []) | join(",")' "$MANIFEST_PATH")
+          echo "Tools requested: ${TOOLS:-(none)}"
+          if echo ",$TOOLS," | grep -q ",emsdk,"; then
+            echo "want_emsdk=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "want_emsdk=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Emscripten SDK
+        if: steps.tools.outputs.want_emsdk == 'true'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Pin to a tested version. Bump deliberately when new features needed.
+          version: '3.1.74'
+          # Cache emsdk so subsequent runs reuse the toolchain (saves ~1.5min).
+          actions-cache-folder: 'emsdk-cache'
+
       - name: Run build.script (if declared)
         env:
           MANIFEST_PATH: ${{ inputs.manifest }}
