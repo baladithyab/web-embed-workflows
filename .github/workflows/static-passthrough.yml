@@ -320,11 +320,19 @@ jobs:
         run: |
           set -euo pipefail
           NEW_URL="${BUCKET_HOST}/${SLUG}/${SHA}/"
+          # Default delivery.mode to 'runtime-r2' when not already set.
+          # This is the dominant mode and lets brand-new manifests omit
+          # the field entirely; the schema otherwise rejects them on
+          # first sync because the rest of delivery has values but mode
+          # is missing.
           jq \
             --arg url "$NEW_URL" \
             --arg version "$SHA" \
             --argjson bytes "$BYTES" \
-            '.delivery.url = $url | .delivery.version = $version | .delivery.sizeBytes = $bytes' \
+            '.delivery.url = $url
+             | .delivery.version = $version
+             | .delivery.sizeBytes = $bytes
+             | .delivery.mode = (.delivery.mode // "runtime-r2")' \
             "$MANIFEST_PATH" > "${MANIFEST_PATH}.new"
           mv "${MANIFEST_PATH}.new" "$MANIFEST_PATH"
 
